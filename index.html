@@ -434,10 +434,12 @@ details.conds summary::before{content:"▸";color:var(--violet-deep);transition:
 <dialog id="settings">
   <div class="in">
     <h2>Settings</h2>
-    <label for="apikey">Anthropic API key</label><input id="apikey" type="password" autocomplete="off" placeholder="sk-ant-…">
-    <label><input type="checkbox" id="remember"> keep the key for this browser tab</label>
-    <label for="model">Model</label><select id="model"><option value="claude-sonnet-5-5">claude-sonnet-5-5</option><option value="claude-opus-5-5">claude-opus-5-5</option><option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option><option value="claude-fable-5-1">claude-fable-5-1</option></select>
-    <p>The key is sent only to api.anthropic.com from this tab; it is never written to a file. A proxy URL can be set in the source (PROXY_URL) so that colleagues or the client never handle a key.</p>
+    <label for="provider">Provider</label><select id="provider"><option value="anthropic">Anthropic — Claude</option><option value="openai">OpenAI — ChatGPT</option><option value="gemini">Google — Gemini</option><option value="deepseek">DeepSeek</option></select>
+    <label for="apikey" id="apikey-label">API key</label><input id="apikey" type="password" autocomplete="off" placeholder="sk-…">
+    <label><input type="checkbox" id="remember"> keep the keys for this browser tab</label>
+    <label for="model">Model</label><input id="model" list="models" autocomplete="off"><datalist id="models"></datalist>
+    <p id="provider-note"></p>
+    <p>Keys are sent only to the selected provider's API from this tab; they are never written to a file. A proxy URL can be set in the source (PROXY_URL, Anthropic only) so that colleagues or the client never handle a key.</p>
     <div class="row" style="justify-content:space-between;align-items:center"><span id="test-out" style="font-size:12px;color:var(--ink-2)"></span><span style="display:flex;gap:8px"><button class="btn" id="test-btn">Test the key and web search</button><button class="btn" id="settings-close">Done</button></span></div>
   </div>
 </dialog>
@@ -1102,28 +1104,26 @@ function parseMemo(memo) {
   return items;
 }
 async function structureMemo(memo, focus) {
-  const sys = "Convert the research memo into structured items. Keep only figures with a numeric value, a source and a URL. Map each figure to a key from the list when it matches the key's definition exactly (units: percentages as fractions, frequencies in per mille, money in euros, comparator quotes in euros per year); otherwise key = null. Do not invent figures. Call the report_benchmark tool with the result.";
-  const userMsg = { role: "user", content: "Key definitions: " + JSON.stringify(BENCH_KEYS) + "\n\nResearch memo:\n" + memo };
-  let d2 = null, mode = "forced";
+  const sys = "Convert the research memo into structured items. Keep only figures with a numeric value, a source and a URL. Map each figure to a key from the list when it matches the key's definition exactly (units: percentages as fractions, frequencies in per mille, money in euros, comparator quotes in euros per year); otherwise key = null. Do not invent figures. Call the report_benchmark tool with the result when a tool is available.";
+  const user = "Key definitions: " + JSON.stringify(BENCH_KEYS) + "\n\nResearch memo:\n" + memo;
   $("bc_status").textContent = "Step 2 of 2 — structuring the memo…";
-  try { d2 = await apiCall({ model: $("model").value, max_tokens: 6000, system: sys, messages: [userMsg], tools: [BENCH_TOOL], tool_choice: { type: "tool", name: "report_benchmark" } }, { timeout: 120000 }); }
-  catch (e) { if (!/tool_choice|not supported/i.test(e.message)) throw e; mode = "auto"; $("bc_status").textContent = "Step 2 of 2 — structuring the memo (tool call left to the model)…"; d2 = await apiCall({ model: $("model").value, max_tokens: 6000, system: sys + " If you cannot call the tool, answer with the JSON object only.", messages: [userMsg], tools: [BENCH_TOOL] }, { timeout: 120000 }); }
-  const tu = (d2.content || []).find(b => b.type === "tool_use"); let parsed = tu ? tu.input : null;
-  if (!parsed) { const txt = (d2.content || []).filter(b => b.type === "text").map(b => b.text).join("\n"); parsed = repairJson(txt); mode += "+json"; }
-  let items = (parsed.items || []).filter(it => it && it.label && typeof it.value === "number").map(it => ({ key: it.key && BENCH_KEYS[it.key] ? it.key : null, label: it.label, value: it.value, unit: it.unit || "", period: it.period || "", source: it.source || "", url: it.url || "", confidence: it.confidence || "medium", note: it.note || "" }));
-  if (!items.length) { items = parseMemo(memo); mode = "memo parser"; }
+  let parsed = {}; try { parsed = await llmStructure(sys, user) || {}; } catch (e) { parsed = {}; S.lastStructError = e.message; }
+  let items = (parsed.items || []).filter(it => it && it.label && typeof it.value === "number").map(it => ({ key: it.key && BENCH_KEYS[it.key] ? it.key : null, label: it.label, value: it.value, unit: it.unit || "", period: it.period || "", source: it.source || "", url: it.url || "", confidence: it.confidence || "medium", note: it.note || "" })); let mode = "structured by " + PROVIDERS[prov()].short;
+  if (!items.length) { items = parseMemo(memo); mode = "memo parser" + (S.lastStructError ? " (structuring failed: " + S.lastStructError.slice(0, 80) + ")" : ""); }
   S.bench = { collected_at: parsed.collected_at || new Date().toISOString().slice(0, 10), focus, items, memo, mode }; renderBench();
   return items;
 }
 async function runCollector() {
-  const key = $("apikey").value.trim(); if (!key && !PROXY_URL) { $("bc_status").textContent = "Enter your API key in Settings."; $("settings").showModal(); return; }
+  if (!apiKey() && !(prov() === "anthropic" && PROXY_URL)) { $("bc_status").textContent = "Enter an API key in Settings."; $("settings").showModal(); return; }
+  if (!PROVIDERS[prov()].web) { $("bc_status").textContent = PROVIDERS[prov()].label + " has no web-search tool: choose Anthropic, OpenAI or Gemini in Settings for the collector (the chat still works with it)."; return; }
   const focus = $("bc_focus").value, year = $("bc_year").value; $("bc_run").disabled = true; $("bc_cancel").hidden = false; const t0 = performance.now(); let memo = "", searches = 0;
   $("bc_memo_box").hidden = false; $("bc_memo").textContent = ""; $("bc_memo_box").open = true;
   try {
     let messages = [{ role: "user", content: memoPromptFor(focus, year) }];
     for (let k = 0; k < 3; k++) {
-      const part = await apiStream({ model: $("model").value, max_tokens: 4000, system: "You are a research analyst for an actuarial due diligence on French motor insurance. You search the web, read the sources and report only what they state, with URLs.", messages, tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 6 }] },
-        (text, n) => { $("bc_status").textContent = "Step 1 of 2 — searching the web… " + (searches + n) + " search" + (searches + n > 1 ? "es" : "") + ", " + (memo.length + text.length) + " characters, " + fmtElapsed(t0); $("bc_memo").textContent = memo + text; });
+      $("bc_status").textContent = "Step 1 of 2 — searching the web with " + PROVIDERS[prov()].short + "… " + fmtElapsed(t0); const tick = setInterval(() => { if (!/search/.test($("bc_status").textContent)) return; $("bc_status").textContent = $("bc_status").textContent.replace(/\d+ s$/, fmtElapsed(t0)); }, 1000);
+      let part; try { part = await llmResearch("You are a research analyst for an actuarial due diligence on French motor insurance. You search the web, read the sources and report only what they state, with URLs.", messages[0].content,
+        (text, n) => { $("bc_status").textContent = "Step 1 of 2 — searching the web… " + (searches + n) + " search" + (searches + n > 1 ? "es" : "") + ", " + (memo.length + text.length) + " characters, " + fmtElapsed(t0); $("bc_memo").textContent = memo + text; }); } finally { clearInterval(tick); }
       memo += (memo && part.text ? "\n" : "") + part.text; searches += part.searches; $("bc_memo").textContent = memo;
       if (part.stop_reason === "pause_turn" || part.stop_reason === "max_tokens") { messages = [{ role: "user", content: memoPromptFor(focus, year) + "\n\nLines already found (do not repeat them, continue with new figures):\n" + memo }]; $("bc_status").textContent = "Step 1 of 2 — continuing the search (" + searches + " searches so far, " + fmtElapsed(t0) + ")…"; continue; }
       break;
@@ -1137,13 +1137,7 @@ async function runCollector() {
 }
 $("bc_cancel").addEventListener("click", () => { if (S.abort) S.abort.abort(); });
 $("bc_restructure").addEventListener("click", async () => { const memo = $("bc_memo").textContent; if (!memo.trim()) return; $("bc_run").disabled = true; try { const items = await structureMemo(memo, $("bc_focus").value); $("bc_status").textContent = items.length + " figures structured from the memo (" + items.filter(i => i.key).length + " matched to parameters)."; } catch (e) { $("bc_status").textContent = "Structuring failed: " + e.message; } finally { $("bc_run").disabled = false; } });
-async function testConnection() {
-  const out = $("test-out"); out.textContent = "Testing…"; const t0 = performance.now();
-  try { const d = await apiCall({ model: $("model").value, max_tokens: 20, messages: [{ role: "user", content: "Reply with the single word OK." }] }, { timeout: 30000 }); const t1 = fmtElapsed(t0);
-    try { const d2 = await apiCall({ model: $("model").value, max_tokens: 200, messages: [{ role: "user", content: "Use web search once to find the current TSCA rate on French motor liability insurance and answer in one line with the source." }], tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }] }, { timeout: 90000 }); const n = (d2.content || []).filter(b => b.type === "server_tool_use").length; out.textContent = "Key OK (" + t1 + "). Web search " + (n ? "OK: " + n + " search in " + fmtElapsed(t0) + "." : "answered without searching (tool may be disabled)."); }
-    catch (e2) { out.textContent = "Key OK (" + t1 + "), but web search failed: " + e2.message; }
-  } catch (e) { out.textContent = "Key test failed: " + e.message; }
-}
+async function testConnection() { const out = $("test-out"); out.textContent = "Testing…"; try { out.textContent = await llmTest(); } catch (e) { out.textContent = "Key test failed: " + e.message + (/failed to fetch|networkerror/i.test(e.message) ? " — the provider may block browser calls (CORS); use a proxy." : ""); } }
 $("test-btn").addEventListener("click", testConnection);
 function benchFmt(it) { const v = it.value; if (typeof v !== "number") return String(v); if (it.unit === "%") return fmt(v, "pct"); if (it.unit === "‰") return v.toFixed(1) + " ‰"; if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(2).replace(/\.?0+$/, "") + " bn " + (it.unit || "€"); if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, "") + " M" + (it.unit || "€"); return fmt(v) + (it.unit && it.unit !== "text" ? " " + it.unit : ""); }
 function hostOf(u) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return u || ""; } }
@@ -1206,6 +1200,61 @@ $("pp_apply").addEventListener("click", () => {
   if (done.length) { S.base = E.run(baseInputs(), S.scen[activeIdx()]); recompute(); renderParams(); } $("pp_note").textContent = done.length ? "Applied (median market quote net of fees, assistance and taxes): " + done.join("; ") : "No formula with quotes.";
 });
 renderProfiles();
+
+// ---------- LLM providers
+const PROVIDERS = {
+  anthropic: { label: "Anthropic — Claude", short: "Claude", models: ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-4-5-20251001", "claude-fable-5-1"], web: true, hint: "sk-ant-…", note: "Web search: server-side tool (used by the benchmark collector). Structured output: tool call." },
+  openai: { label: "OpenAI — ChatGPT", short: "ChatGPT", models: ["gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o"], web: true, hint: "sk-…", note: "Web search: Responses API web_search tool. Structured output: JSON schema. Browser calls are allowed by the API but expose the key to anyone who can open the page: use your own key only." },
+  gemini: { label: "Google — Gemini", short: "Gemini", models: ["gemini-2.5-pro", "gemini-2.5-flash"], web: true, hint: "AIza…", note: "Web search: Google Search grounding. Structured output: JSON mode." },
+  deepseek: { label: "DeepSeek", short: "DeepSeek", models: ["deepseek-chat", "deepseek-reasoner"], web: false, hint: "sk-…", note: "Chat and structuring only: DeepSeek has no web-search tool, so the benchmark collector needs another provider. If the browser blocks the call (CORS), route it through a proxy." } };
+S.keys = {}; try { S.keys = JSON.parse(sessionStorage.getItem("nexius_keys") || "{}"); } catch (e) {}
+S.modelByProv = {}; try { S.modelByProv = JSON.parse(sessionStorage.getItem("nexius_models") || "{}"); } catch (e) {}
+function prov() { return $("provider").value || "anthropic"; }
+function apiKey() { return ($("apikey").value || "").trim(); }
+function modelName() { return ($("model").value || "").trim() || PROVIDERS[prov()].models[0]; }
+function syncProviderUI() { const p = prov(), P = PROVIDERS[p]; $("apikey-label").textContent = P.label.split(" — ")[0] + " API key"; $("apikey").placeholder = P.hint; $("apikey").value = S.keys[p] || ""; $("models").innerHTML = P.models.map(m => "<option value='" + m + "'>").join(""); $("model").value = S.modelByProv[p] || P.models[0]; $("provider-note").textContent = P.note; keyState(); }
+function persistKeys() { S.keys[prov()] = apiKey(); S.modelByProv[prov()] = modelName(); try { if ($("remember").checked) { sessionStorage.setItem("nexius_keys", JSON.stringify(S.keys)); sessionStorage.setItem("nexius_models", JSON.stringify(S.modelByProv)); } else { sessionStorage.removeItem("nexius_keys"); sessionStorage.removeItem("nexius_models"); } } catch (e) {} }
+function keyState() { const has = apiKey().length > 0 || (prov() === "anthropic" && !!PROXY_URL); const c = $("ai-chip"); c.className = "chip " + (has ? "ok" : ""); c.innerHTML = "<i></i>" + (has ? PROVIDERS[prov()].short + " · " + modelName() : "no key"); }
+function withTimeout(ms) { const ctl = new AbortController(); S.abort = ctl; const t = setTimeout(() => ctl.abort(), ms); return { signal: ctl.signal, done: () => clearTimeout(t) }; }
+async function postJSON(url, headers, body, ms) { const t = withTimeout(ms || 150000); try { const res = await fetch(url, { method: "POST", headers: Object.assign({ "content-type": "application/json" }, headers), body: JSON.stringify(body), signal: t.signal }); let data = null; try { data = await res.json(); } catch (e) { data = {}; } if (!res.ok) throw new Error((data.error && (data.error.message || JSON.stringify(data.error))) || ("HTTP " + res.status)); return data; } finally { t.done(); } }
+function anthHeaders() { const h = { "anthropic-version": "2023-06-01" }; if (!PROXY_URL) { h["x-api-key"] = apiKey(); h["anthropic-dangerous-direct-browser-access"] = "true"; } return h; }
+function anthUrl() { return PROXY_URL || "https://api.anthropic.com/v1/messages"; }
+function oaText(d) { if (d.output_text) return d.output_text; return (d.output || []).filter(o => o.type === "message").flatMap(o => o.content || []).filter(c => c.type === "output_text").map(c => c.text).join("\n"); }
+function gemText(d) { return ((d.candidates || [])[0] || {}).content ? d.candidates[0].content.parts.filter(p => p.text).map(p => p.text).join("") : ""; }
+function gemSources(d) { const g = ((d.candidates || [])[0] || {}).groundingMetadata; const ch = g && g.groundingChunks ? g.groundingChunks.filter(c => c.web && c.web.uri).map(c => (c.web.title || "") + " | " + c.web.uri) : []; return ch; }
+// chat: returns the assistant text
+async function llmChat(system, messages, maxTokens) {
+  const p = prov(), model = modelName();
+  if (p === "anthropic") { const d = await postJSON(anthUrl(), anthHeaders(), { model, max_tokens: maxTokens, system, messages }); return (d.content || []).filter(b => b.type === "text").map(b => b.text).join("\n"); }
+  if (p === "gemini") { const d = await postJSON("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", { "x-goog-api-key": apiKey() }, { systemInstruction: { parts: [{ text: system }] }, contents: messages.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })), generationConfig: { maxOutputTokens: maxTokens } }); return gemText(d); }
+  const url = p === "openai" ? "https://api.openai.com/v1/chat/completions" : "https://api.deepseek.com/chat/completions";
+  const d = await postJSON(url, { "authorization": "Bearer " + apiKey() }, { model, messages: [{ role: "system", content: system }].concat(messages), max_tokens: maxTokens }); return ((d.choices || [])[0] || {}).message ? d.choices[0].message.content : "";
+}
+// research with web search: returns { text, searches, stop_reason }
+async function llmResearch(system, prompt, onProgress) {
+  const p = prov(), model = modelName();
+  if (p === "anthropic") return apiStream({ model, max_tokens: 4000, system, messages: [{ role: "user", content: prompt }], tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 6 }] }, onProgress);
+  if (p === "openai") { const d = await postJSON("https://api.openai.com/v1/responses", { "authorization": "Bearer " + apiKey() }, { model, instructions: system, input: [{ role: "user", content: prompt }], tools: [{ type: "web_search_preview" }] }, 300000); return { text: oaText(d), searches: (d.output || []).filter(o => o.type === "web_search_call").length, stop_reason: d.status === "incomplete" ? "max_tokens" : "end_turn" }; }
+  if (p === "gemini") { const d = await postJSON("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", { "x-goog-api-key": apiKey() }, { systemInstruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text: prompt }] }], tools: [{ google_search: {} }] }, 300000); const src = gemSources(d); return { text: gemText(d) + (src.length ? "\n\nSources:\n" + src.join("\n") : ""), searches: ((d.candidates || [])[0] || {}).groundingMetadata && d.candidates[0].groundingMetadata.webSearchQueries ? d.candidates[0].groundingMetadata.webSearchQueries.length : (src.length ? 1 : 0), stop_reason: "end_turn" }; }
+  throw new Error(PROVIDERS[p].label + " has no web-search tool: choose Anthropic, OpenAI or Gemini for the collector.");
+}
+// structuring: returns a parsed object { collected_at, items }
+async function llmStructure(system, user) {
+  const p = prov(), model = modelName();
+  if (p === "anthropic") { let d = null; try { d = await postJSON(anthUrl(), anthHeaders(), { model, max_tokens: 6000, system, messages: [{ role: "user", content: user }], tools: [BENCH_TOOL], tool_choice: { type: "tool", name: "report_benchmark" } }, 120000); } catch (e) { if (!/tool_choice|not supported/i.test(e.message)) throw e; d = await postJSON(anthUrl(), anthHeaders(), { model, max_tokens: 6000, system: system + " If you cannot call the tool, answer with the JSON object only.", messages: [{ role: "user", content: user }], tools: [BENCH_TOOL] }, 120000); }
+    const tu = (d.content || []).find(b => b.type === "tool_use"); if (tu) return tu.input; return repairJson((d.content || []).filter(b => b.type === "text").map(b => b.text).join("\n")); }
+  if (p === "gemini") { const d = await postJSON("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent", { "x-goog-api-key": apiKey() }, { systemInstruction: { parts: [{ text: system + " Answer with a JSON object {collected_at, items:[...]} and nothing else." }] }, contents: [{ role: "user", parts: [{ text: user }] }], generationConfig: { responseMimeType: "application/json", maxOutputTokens: 6000 } }, 120000); return repairJson(gemText(d)); }
+  const url = p === "openai" ? "https://api.openai.com/v1/chat/completions" : "https://api.deepseek.com/chat/completions";
+  const body = { model, messages: [{ role: "system", content: system + " Answer with a JSON object {collected_at, items:[...]} and nothing else." }, { role: "user", content: user }], max_tokens: 6000 };
+  if (p === "openai") body.response_format = { type: "json_schema", json_schema: { name: "report_benchmark", schema: BENCH_TOOL.input_schema } }; else body.response_format = { type: "json_object" };
+  let d; try { d = await postJSON(url, { "authorization": "Bearer " + apiKey() }, body, 120000); } catch (e) { if (!/response_format|json_schema|schema/i.test(e.message)) throw e; delete body.response_format; d = await postJSON(url, { "authorization": "Bearer " + apiKey() }, body, 120000); }
+  return repairJson(((d.choices || [])[0] || {}).message ? d.choices[0].message.content : "");
+}
+async function llmTest() {
+  const t0 = performance.now(); const txt = await llmChat("Reply with the single word OK.", [{ role: "user", content: "ping" }], 20); const t1 = fmtElapsed(t0);
+  if (!PROVIDERS[prov()].web) return "Key OK (" + t1 + ", answer: " + String(txt).slice(0, 20) + "). This provider has no web search: the chat works, the collector needs another provider.";
+  try { const r = await llmResearch("You are a research assistant. Use web search.", "Use web search once to find the current TSCA rate on French motor liability insurance and answer in one line with the source URL.", null); return "Key OK (" + t1 + "). Web search " + (r.searches ? "OK: " + r.searches + " search in " + fmtElapsed(t0) + "." : "answered without searching (tool may be disabled or unsupported by this model)."); } catch (e) { return "Key OK (" + t1 + "), but web search failed: " + e.message; }
+}
 // ---------- AI drawer
 const drawer = $("drawer");
 $("ai-btn").addEventListener("click", () => { drawer.classList.add("open"); $("q").focus(); }); $("ai-close").addEventListener("click", () => drawer.classList.remove("open"));
@@ -1244,24 +1293,22 @@ function md(t) { let h = esc(t); h = h.replace(/```([\s\S]*?)```/g, (m, c) => "<
   return h.split(/\n{2,}/).map(p => /^<(h\d|ul|ol|table|pre)/.test(p.trim()) ? p : "<p>" + p.replace(/\n/g, "<br>") + "</p>").join(""); }
 function addMsg(role, text, err) { $("empty")?.remove(); const d = document.createElement("div"); d.className = "msg " + role + (err ? " err" : ""); d.innerHTML = "<div class='who'>" + (role === "user" ? "You" : "Claude") + "</div>" + (role === "assistant" ? "<div class='md'></div><button class='cp'>Copy</button>" : "<pre></pre>"); const body = d.querySelector(role === "assistant" ? ".md" : "pre"); if (role === "assistant") body.innerHTML = md(text); else body.textContent = text; d.dataset.raw = text; const cp = d.querySelector(".cp"); if (cp) cp.addEventListener("click", () => { navigator.clipboard.writeText(d.dataset.raw || ""); cp.textContent = "Copied"; setTimeout(() => cp.textContent = "Copy", 1500); }); $("thread").appendChild(d); $("thread").scrollTop = $("thread").scrollHeight; return d; }
 async function ask(q) {
-  q = (q || $("q").value).trim(); if (!q) return; const key = $("apikey").value.trim();
-  if (!key && !PROXY_URL) { addMsg("assistant", "Enter your Anthropic API key in Settings first.", true); $("settings").showModal(); return; }
+  q = (q || $("q").value).trim(); if (!q) return;
+  if (!apiKey() && !(prov() === "anthropic" && PROXY_URL)) { addMsg("assistant", "Enter an API key in Settings first (Anthropic, OpenAI, Gemini or DeepSeek).", true); $("settings").showModal(); return; }
   $("q").value = ""; addMsg("user", q); S.history.push({ role: "user", content: q }); const wait = addMsg("assistant", "…"); $("send").disabled = true;
-  try {
-    const headers = { "content-type": "application/json", "anthropic-version": "2023-06-01" }; if (!PROXY_URL) { headers["x-api-key"] = key; headers["anthropic-dangerous-direct-browser-access"] = "true"; }
-    const res = await fetch(PROXY_URL || "https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify({ model: $("model").value, max_tokens: 2500, system: systemPrompt(), messages: S.history }) });
-    const data = await res.json(); if (!res.ok) throw new Error((data.error && data.error.message) || ("HTTP " + res.status));
-    const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n"); wait.querySelector(".md").innerHTML = md(text); wait.dataset.raw = text; S.history.push({ role: "assistant", content: text });
-  } catch (e) { wait.classList.add("err"); wait.querySelector(".md").textContent = "Request failed: " + e.message + ". Check the key, the model and your network."; S.history.pop(); }
+  try { const text = await llmChat(systemPrompt(), S.history, 2500); wait.querySelector(".md").innerHTML = md(text); wait.dataset.raw = text; S.history.push({ role: "assistant", content: text }); }
+  catch (e) { wait.classList.add("err"); wait.querySelector(".md").textContent = "Request failed: " + e.message + ". Check the key, the model and your network" + (/failed to fetch|networkerror/i.test(e.message) ? " — if the provider blocks browser calls (CORS), use a proxy." : "."); S.history.pop(); }
   finally { $("send").disabled = false; $("thread").scrollTop = $("thread").scrollHeight; }
 }
 $("send").addEventListener("click", () => ask()); $("q").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) ask(); });
 document.querySelectorAll("#chips button").forEach(b => b.addEventListener("click", () => ask(b.dataset.q)));
 // settings
 $("settings-btn").addEventListener("click", () => $("settings").showModal()); $("print-btn").addEventListener("click", () => window.print()); $("settings-close").addEventListener("click", () => $("settings").close());
-try { const k = sessionStorage.getItem("nexius_key"); if (k) { $("apikey").value = k; $("remember").checked = true; } } catch (e) {}
-function keyState() { const has = $("apikey").value.trim().length > 0; const c = $("ai-chip"); c.className = "chip " + (has ? "ok" : ""); c.innerHTML = "<i></i>" + (has ? $("model").value : "no key"); try { if ($("remember").checked) sessionStorage.setItem("nexius_key", $("apikey").value); else sessionStorage.removeItem("nexius_key"); } catch (e) {} }
-["apikey", "remember", "model"].forEach(id => $(id).addEventListener("change", keyState)); keyState();
+try { if (sessionStorage.getItem("nexius_keys")) $("remember").checked = true; } catch (e) {}
+$("provider").addEventListener("change", () => { syncProviderUI(); persistKeys(); });
+["apikey", "model"].forEach(id => $(id).addEventListener("change", () => { persistKeys(); keyState(); }));
+$("remember").addEventListener("change", persistKeys);
+syncProviderUI();
 // go
 S.inputs = Object.assign({}, E.DEFAULTS); S.orig = Object.assign({}, E.DEFAULTS); initFromBase(); renderParams(); renderGridEditors();
 </script>
