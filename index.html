@@ -338,9 +338,10 @@ details.conds summary::before{content:"▸";color:var(--violet-deep);transition:
         <div class="mcctl" style="margin-bottom:10px">
           <label>Focus <select id="bc_focus"><option value="market">French motor market statistics (France Assureurs, ACPR)</option><option value="comparators">Comparator barometers by profile and formula (LeLynx, LesFurets, Assurland)</option><option value="competitors">Digital competitors' offers and prices (L'olivier, Leocare, Flitter, Ornikar, Direct Assurance)</option><option value="taxes">Taxes, contributions and IRSA parameters</option><option value="all">All of the above</option></select></label>
           <label>Year <input id="bc_year" type="number" value="2026" style="width:70px;padding:4px;border:1px solid var(--line);border-radius:4px"></label>
-          <button class="btn small primary" id="bc_run">Collect</button><span id="bc_status"></span>
+          <button class="btn small primary" id="bc_run">Collect</button><button class="btn small" id="bc_cancel" hidden>Cancel</button><span id="bc_status"></span>
         </div>
-        <div id="bc_out"><p class="empty">Results appear here: each figure with its source, date and a button to push it into the matching parameter. Requires an API key with the web-search tool enabled; each run performs up to eight searches.</p></div>
+        <details id="bc_memo_box" hidden><summary style="cursor:pointer;font-size:12px;color:var(--ink-2)">Research memo (raw text from the search step)</summary><pre id="bc_memo" style="white-space:pre-wrap;font-size:12px;max-height:260px;overflow:auto;background:var(--surface);padding:8px;border-radius:6px"></pre><button class="btn small" id="bc_restructure">Retry the structuring step</button></details>
+        <div id="bc_out"><p class="empty">Results appear here: each figure with its source, date and a button to push it into the matching parameter. A run takes one to three minutes: the search step streams its progress here, then a second call structures the figures. Requires an API key with the web-search tool enabled (test it in Settings).</p></div>
         <div class="mcctl" style="margin-top:10px"><button class="btn small" id="bc_apply_all">Apply all matched figures</button><button class="btn small" id="bc_save">Save benchmark (.json)</button><button class="btn small" id="bc_load">Load benchmark</button><input id="bc_file" type="file" accept=".json" hidden><span class="chip" id="bc_chip"><i></i>no benchmark loaded</span></div>
       </div>
       <div class="card">
@@ -437,7 +438,7 @@ details.conds summary::before{content:"▸";color:var(--violet-deep);transition:
     <label><input type="checkbox" id="remember"> keep the key for this browser tab</label>
     <label for="model">Model</label><select id="model"><option value="claude-sonnet-5-5">claude-sonnet-5-5</option><option value="claude-opus-5-5">claude-opus-5-5</option><option value="claude-haiku-4-5-20251001">claude-haiku-4-5-20251001</option><option value="claude-fable-5-1">claude-fable-5-1</option></select>
     <p>The key is sent only to api.anthropic.com from this tab; it is never written to a file. A proxy URL can be set in the source (PROXY_URL) so that colleagues or the client never handle a key.</p>
-    <div class="row"><button class="btn" id="settings-close">Done</button></div>
+    <div class="row" style="justify-content:space-between;align-items:center"><span id="test-out" style="font-size:12px;color:var(--ink-2)"></span><span style="display:flex;gap:8px"><button class="btn" id="test-btn">Test the key and web search</button><button class="btn" id="settings-close">Done</button></span></div>
   </div>
 </dialog>
 
@@ -995,7 +996,7 @@ function renderParams() {
   const n = changedKeys().length; const c = $("p_changed"); c.className = "chip " + (n ? "warn" : ""); c.innerHTML = "<i></i>" + (n ? n + " parameter" + (n > 1 ? "s" : "") + " changed" : "no change");
   S.gaps = META.filter(m => m.f).map(m => [m.l, typeof paramValue(m.k) === "number" ? (isPct(m.u) ? fmt(paramValue(m.k), "pct") : (m.u === "x" ? paramValue(m.k).toFixed(2) + "×" : fmt(paramValue(m.k)))) : String(paramValue(m.k))]);
 }
-function changedKeys() { if (!S.orig) return []; return META.filter(m => String(paramValue(m.k)) !== String(S.orig[m.k])).map(m => m.k); }
+function changedKeys() { if (!S.orig) return []; const norm = v => (v === undefined || v === null) ? "" : String(v); return META.filter(m => norm(paramValue(m.k)) !== norm(S.orig[m.k])).map(m => m.k); }
 function setParam(k, raw) {
   const m = META.find(x => x.k === k); if (!m) return; if (!S.inputs) S.inputs = Object.assign({}, E.DEFAULTS);
   let v;
@@ -1069,37 +1070,67 @@ function benchPrompt(focus, year) {
   const list = focus === "all" ? Object.values(themes).join(" ") : themes[focus];
   return "Collect, with web searches, the most recent published figures for " + year + " (or the latest available) on: " + list + "\nReturn ONLY a JSON object, no prose before or after, with this shape: {\"collected_at\": \"<ISO date>\", \"items\": [{\"key\": <one of " + JSON.stringify(Object.keys(BENCH_KEYS)) + " or null>, \"label\": \"<short label>\", \"value\": <number, percentages as fractions e.g. 0.145, frequencies in per mille, money in euros>, \"unit\": \"<€ | % | ‰ | €/yr | text>\", \"period\": \"<year or date>\", \"source\": \"<publisher and document>\", \"url\": \"<url>\", \"confidence\": \"<high|medium|low>\", \"note\": \"<how it was measured, caveats, max 25 words>\"}]}\nRules: one item per figure; only figures actually found in the sources; never estimate; quote the exact publication; prefer primary sources (France Assureurs, ACPR, BOFiP, the comparator's own barometer page) over press; if a figure is not found, omit it; include at least the URL for every item; keys must match the list or be null.";
 }
-async function apiCall(body) {
-  const key = $("apikey").value.trim(); const headers = { "content-type": "application/json", "anthropic-version": "2023-06-01" }; if (!PROXY_URL) { headers["x-api-key"] = key; headers["anthropic-dangerous-direct-browser-access"] = "true"; }
-  const res = await fetch(PROXY_URL || "https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body) }); const data = await res.json(); if (!res.ok) throw new Error((data.error && data.error.message) || ("HTTP " + res.status)); return data;
+async function apiCall(body, opts) {
+  opts = opts || {}; const key = $("apikey").value.trim(); const headers = { "content-type": "application/json", "anthropic-version": "2023-06-01" }; if (!PROXY_URL) { headers["x-api-key"] = key; headers["anthropic-dangerous-direct-browser-access"] = "true"; }
+  const ctl = new AbortController(); S.abort = ctl; const timer = setTimeout(() => ctl.abort(), opts.timeout || 150000);
+  try { const res = await fetch(PROXY_URL || "https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(body), signal: ctl.signal }); const data = await res.json(); if (!res.ok) throw new Error((data.error && data.error.message) || ("HTTP " + res.status)); return data; }
+  finally { clearTimeout(timer); }
 }
-const BENCH_TOOL = { name: "report_benchmark", description: "Report the collected benchmark figures as structured data.", input_schema: { type: "object", properties: { collected_at: { type: "string" }, items: { type: "array", items: { type: "object", properties: { key: { type: ["string", "null"], enum: Object.keys(BENCH_KEYS).concat([null]) }, label: { type: "string" }, value: { type: "number" }, unit: { type: "string" }, period: { type: "string" }, source: { type: "string" }, url: { type: "string" }, confidence: { type: "string", enum: ["high", "medium", "low"] }, note: { type: "string" } }, required: ["label", "value", "unit", "source", "url"] } } }, required: ["items"] } };
-function repairJson(txt) { let t = txt.replace(/^[\s\S]*?(\{[\s\S]*\})[\s\S]*$/, "$1"); t = t.replace(/,\s*([}\]])/g, "$1").replace(/[\u0000-\u001f]+/g, " "); try { return JSON.parse(t); } catch (e) { const items = []; const re = /\{[^{}]*"label"[^{}]*\}/g; let m; while ((m = re.exec(t))) { try { items.push(JSON.parse(m[0].replace(/,\s*}/g, "}"))); } catch (e2) {} } if (items.length) return { items }; throw e; } }
+// streaming call: returns { text, stop_reason, searches }; onProgress(text, searches) is called as the answer arrives
+async function apiStream(body, onProgress, opts) {
+  opts = opts || {}; const key = $("apikey").value.trim(); const headers = { "content-type": "application/json", "anthropic-version": "2023-06-01", "accept": "text/event-stream" }; if (!PROXY_URL) { headers["x-api-key"] = key; headers["anthropic-dangerous-direct-browser-access"] = "true"; }
+  const ctl = new AbortController(); S.abort = ctl; const timer = setTimeout(() => ctl.abort(), opts.timeout || 300000);
+  try {
+    const res = await fetch(PROXY_URL || "https://api.anthropic.com/v1/messages", { method: "POST", headers, body: JSON.stringify(Object.assign({}, body, { stream: true })), signal: ctl.signal });
+    if (!res.ok) { let msg = "HTTP " + res.status; try { const j = await res.json(); msg = (j.error && j.error.message) || msg; } catch (e) {} throw new Error(msg); }
+    const out = { text: "", stop_reason: null, searches: 0 }; const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
+    const handle = ev => { if (!ev) return; if (ev.type === "content_block_start" && ev.content_block && ev.content_block.type === "server_tool_use") out.searches++; else if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") out.text += ev.delta.text; else if (ev.type === "message_delta" && ev.delta && ev.delta.stop_reason) out.stop_reason = ev.delta.stop_reason; else if (ev.type === "error") throw new Error(ev.error && ev.error.message || "stream error"); if (onProgress) onProgress(out.text, out.searches); };
+    while (true) { const { value, done } = await reader.read(); if (done) break; buf += dec.decode(value, { stream: true }); let idx; while ((idx = buf.indexOf("\n\n")) >= 0) { const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2); const dataLine = chunk.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join(""); if (!dataLine || dataLine === "[DONE]") continue; try { handle(JSON.parse(dataLine)); } catch (e) { if (e.message && !/JSON/.test(e.message)) throw e; } } }
+    return out;
+  } finally { clearTimeout(timer); }
+}
+const BENCH_TOOL = { name: "report_benchmark", description: "Report the collected benchmark figures as structured data.", input_schema: { type: "object", properties: { collected_at: { type: "string" }, items: { type: "array", items: { type: "object", properties: { key: { type: ["string", "null"] }, label: { type: "string" }, value: { type: "number" }, unit: { type: "string" }, period: { type: "string" }, source: { type: "string" }, url: { type: "string" }, confidence: { type: "string", enum: ["high", "medium", "low"] }, note: { type: "string" } }, required: ["label", "value", "unit", "source", "url"] } } }, required: ["items"] } };
+function repairJson(txt) { let t = txt.replace(/^[\s\S]*?(\{[\s\S]*\})[\s\S]*$/, "$1"); t = t.replace(/,\s*([}\]])/g, "$1").replace(/[\u0000-\u001f]+/g, " "); try { return JSON.parse(t); } catch (e) { const items = []; const re = /\{[^{}]*"label"[^{}]*\}/g; let m; while ((m = re.exec(txt))) { try { items.push(JSON.parse(m[0].replace(/,\s*}/g, "}"))); } catch (e2) {} } return { items }; } }
+function memoPromptFor(focus, year) { return benchPrompt(focus, year).replace(/Return ONLY a JSON object[\s\S]*$/, "Write a research memo: one line per figure found, in the form 'FIGURE | VALUE with unit | PERIOD | PUBLISHER and document | URL | how it is measured'. Report only figures actually stated by a source you opened, never estimates; prefer primary sources (France Assureurs, ACPR, BOFiP, the comparator's own barometer page) over press; at most 30 lines; no introduction, no conclusion."); }
+function fmtElapsed(t0) { return Math.round((performance.now() - t0) / 1000) + " s"; }
+async function structureMemo(memo, focus) {
+  $("bc_status").textContent = "Step 2 of 2 — structuring the memo…";
+  const d2 = await apiCall({ model: $("model").value, max_tokens: 6000, system: "Convert the research memo into structured items. Keep only figures with a numeric value, a source and a URL. Map each figure to a key from the list when it matches the key's definition exactly (units: percentages as fractions, frequencies in per mille, money in euros); otherwise key = null. Do not invent figures.", messages: [{ role: "user", content: "Key definitions: " + JSON.stringify(BENCH_KEYS) + "\n\nResearch memo:\n" + memo }], tools: [BENCH_TOOL], tool_choice: { type: "tool", name: "report_benchmark" } }, { timeout: 120000 });
+  const tu = (d2.content || []).find(b => b.type === "tool_use"); let parsed = tu ? tu.input : null;
+  if (!parsed) { const txt = (d2.content || []).filter(b => b.type === "text").map(b => b.text).join("\n"); parsed = repairJson(txt); }
+  const items = (parsed.items || []).filter(it => it && it.label && typeof it.value === "number").map(it => ({ key: it.key && BENCH_KEYS[it.key] ? it.key : null, label: it.label, value: it.value, unit: it.unit || "", period: it.period || "", source: it.source || "", url: it.url || "", confidence: it.confidence || "medium", note: it.note || "" }));
+  S.bench = { collected_at: parsed.collected_at || new Date().toISOString().slice(0, 10), focus, items, memo }; renderBench();
+  return items;
+}
 async function runCollector() {
   const key = $("apikey").value.trim(); if (!key && !PROXY_URL) { $("bc_status").textContent = "Enter your API key in Settings."; $("settings").showModal(); return; }
-  const focus = $("bc_focus").value, year = $("bc_year").value; $("bc_status").textContent = "Step 1 of 2 — searching the web…"; $("bc_run").disabled = true;
+  const focus = $("bc_focus").value, year = $("bc_year").value; $("bc_run").disabled = true; $("bc_cancel").hidden = false; const t0 = performance.now(); let memo = "", searches = 0;
+  $("bc_memo_box").hidden = false; $("bc_memo").textContent = ""; $("bc_memo_box").open = true;
   try {
-    // step 1: research memo with the server-side web search tool; continue while the API pauses the turn
-    const memoPrompt = benchPrompt(focus, year).replace(/Return ONLY a JSON object[\s\S]*$/, "Write a research memo: one line per figure found, in the form 'FIGURE | VALUE with unit | PERIOD | PUBLISHER and document | URL | how it is measured'. Report only figures you actually read in the sources, with the exact URL of the page; never estimate; prefer primary sources (France Assureurs, ACPR, BOFiP, the comparators' own barometer pages) over press. Then stop.");
-    let messages = [{ role: "user", content: memoPrompt }], data, searches = 0, memo = "";
-    for (let k = 0; k < 4; k++) {
-      data = await apiCall({ model: $("model").value, max_tokens: 6000, system: "You are a research analyst for an actuarial due diligence on French motor insurance. You search the web, read the sources and report only what they state, with URLs.", messages, tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }] });
-      searches += (data.content || []).filter(b => b.type === "server_tool_use").length; memo += (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
-      if (data.stop_reason === "pause_turn") { messages = messages.concat([{ role: "assistant", content: data.content }, { role: "user", content: "Continue." }]); $("bc_status").textContent = "Step 1 of 2 — continuing the search (" + searches + " searches so far)…"; continue; }
+    let messages = [{ role: "user", content: memoPromptFor(focus, year) }];
+    for (let k = 0; k < 3; k++) {
+      const part = await apiStream({ model: $("model").value, max_tokens: 4000, system: "You are a research analyst for an actuarial due diligence on French motor insurance. You search the web, read the sources and report only what they state, with URLs.", messages, tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 6 }] },
+        (text, n) => { $("bc_status").textContent = "Step 1 of 2 — searching the web… " + (searches + n) + " search" + (searches + n > 1 ? "es" : "") + ", " + (memo.length + text.length) + " characters, " + fmtElapsed(t0); $("bc_memo").textContent = memo + text; });
+      memo += (memo && part.text ? "\n" : "") + part.text; searches += part.searches; $("bc_memo").textContent = memo;
+      if (part.stop_reason === "pause_turn" || part.stop_reason === "max_tokens") { messages = [{ role: "user", content: memoPromptFor(focus, year) + "\n\nLines already found (do not repeat them, continue with new figures):\n" + memo }]; $("bc_status").textContent = "Step 1 of 2 — continuing the search (" + searches + " searches so far, " + fmtElapsed(t0) + ")…"; continue; }
       break;
     }
     if (!memo.trim()) throw new Error("the search returned no text");
-    // step 2: structure the memo with a forced tool call (guaranteed JSON)
-    $("bc_status").textContent = "Step 2 of 2 — structuring " + searches + " searches…";
-    const d2 = await apiCall({ model: $("model").value, max_tokens: 6000, system: "Convert the research memo into structured items. Keep only figures with a value, a source and a URL. Map each figure to a key from the list when it matches the key's definition exactly (units: percentages as fractions, frequencies in per mille, money in euros); otherwise key = null. Do not invent figures.", messages: [{ role: "user", content: "Key definitions: " + JSON.stringify(BENCH_KEYS) + "\n\nResearch memo:\n" + memo }], tools: [BENCH_TOOL], tool_choice: { type: "tool", name: "report_benchmark" } });
-    const tu = (d2.content || []).find(b => b.type === "tool_use"); let parsed = tu ? tu.input : null;
-    if (!parsed) { const txt = (d2.content || []).filter(b => b.type === "text").map(b => b.text).join("\n"); parsed = repairJson(txt); }
-    const items = (parsed.items || []).filter(it => it && it.label && typeof it.value === "number").map(it => ({ key: it.key && BENCH_KEYS[it.key] ? it.key : null, label: it.label, value: it.value, unit: it.unit || "", period: it.period || "", source: it.source || "", url: it.url || "", confidence: it.confidence || "medium", note: it.note || "" }));
-    S.bench = { collected_at: parsed.collected_at || new Date().toISOString().slice(0, 10), focus, items, memo }; renderBench();
-    $("bc_status").textContent = items.length + " figures from " + searches + " searches (" + items.filter(i => i.key).length + " matched to parameters).";
-  } catch (e) { $("bc_status").textContent = "Failed: " + e.message + (/(tool|web_search|not enabled|permission)/i.test(e.message) ? " — the web-search tool must be enabled for this API key." : ""); }
-  finally { $("bc_run").disabled = false; }
+    const items = await structureMemo(memo, focus);
+    $("bc_status").textContent = items.length + " figures from " + searches + " searches in " + fmtElapsed(t0) + " (" + items.filter(i => i.key).length + " matched to parameters).";
+  } catch (e) { const aborted = e.name === "AbortError"; $("bc_status").textContent = aborted ? "Cancelled after " + fmtElapsed(t0) + (memo ? " — the memo collected so far is shown above; you can structure it with the button." : ".") : "Failed after " + fmtElapsed(t0) + ": " + e.message + (/(tool|web_search|not enabled|permission)/i.test(e.message) ? " — the web-search tool must be enabled for this API key (Settings → Test)." : "") + (memo ? " The memo collected so far is shown above." : ""); }
+  finally { $("bc_run").disabled = false; $("bc_cancel").hidden = true; S.abort = null; }
 }
+$("bc_cancel").addEventListener("click", () => { if (S.abort) S.abort.abort(); });
+$("bc_restructure").addEventListener("click", async () => { const memo = $("bc_memo").textContent; if (!memo.trim()) return; $("bc_run").disabled = true; try { const items = await structureMemo(memo, $("bc_focus").value); $("bc_status").textContent = items.length + " figures structured from the memo (" + items.filter(i => i.key).length + " matched to parameters)."; } catch (e) { $("bc_status").textContent = "Structuring failed: " + e.message; } finally { $("bc_run").disabled = false; } });
+async function testConnection() {
+  const out = $("test-out"); out.textContent = "Testing…"; const t0 = performance.now();
+  try { const d = await apiCall({ model: $("model").value, max_tokens: 20, messages: [{ role: "user", content: "Reply with the single word OK." }] }, { timeout: 30000 }); const t1 = fmtElapsed(t0);
+    try { const d2 = await apiCall({ model: $("model").value, max_tokens: 200, messages: [{ role: "user", content: "Use web search once to find the current TSCA rate on French motor liability insurance and answer in one line with the source." }], tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 1 }] }, { timeout: 90000 }); const n = (d2.content || []).filter(b => b.type === "server_tool_use").length; out.textContent = "Key OK (" + t1 + "). Web search " + (n ? "OK: " + n + " search in " + fmtElapsed(t0) + "." : "answered without searching (tool may be disabled)."); }
+    catch (e2) { out.textContent = "Key OK (" + t1 + "), but web search failed: " + e2.message; }
+  } catch (e) { out.textContent = "Key test failed: " + e.message; }
+}
+$("test-btn").addEventListener("click", testConnection);
 function benchFmt(it) { const v = it.value; if (typeof v !== "number") return String(v); if (it.unit === "%") return fmt(v, "pct"); if (it.unit === "‰") return v.toFixed(1) + " ‰"; return fmt(v) + (it.unit && it.unit !== "text" ? " " + it.unit : ""); }
 function renderBench() {
   const b = S.bench; const chip = $("bc_chip"); if (!b) { chip.className = "chip"; chip.innerHTML = "<i></i>no benchmark loaded"; return; }
