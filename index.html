@@ -332,7 +332,7 @@ details.conds summary::before{content:"▸";color:var(--violet-deep);transition:
 
   <section id="bench">
     <div class="sec-h"><h2>Benchmark agents</h2><p>Two agents keep the market side of the twin alive: a collector that searches the web through Claude and returns sourced figures you can push into the parameters, and a profile panel that turns comparator quotes into a price position for Nexius.</p><button class="btn small ask" data-ask="bench">Ask about this</button></div>
-    <div class="grid g2">
+    <div class="grid" style="grid-template-columns:1fr">
       <div class="card">
         <h3>Agent 1 — benchmark collector (Claude with web search)</h3>
         <div class="mcctl" style="margin-bottom:10px">
@@ -1093,13 +1093,26 @@ const BENCH_TOOL = { name: "report_benchmark", description: "Report the collecte
 function repairJson(txt) { let t = txt.replace(/^[\s\S]*?(\{[\s\S]*\})[\s\S]*$/, "$1"); t = t.replace(/,\s*([}\]])/g, "$1").replace(/[\u0000-\u001f]+/g, " "); try { return JSON.parse(t); } catch (e) { const items = []; const re = /\{[^{}]*"label"[^{}]*\}/g; let m; while ((m = re.exec(txt))) { try { items.push(JSON.parse(m[0].replace(/,\s*}/g, "}"))); } catch (e2) {} } return { items }; } }
 function memoPromptFor(focus, year) { return benchPrompt(focus, year).replace(/Return ONLY a JSON object[\s\S]*$/, "Write a research memo: one line per figure found, in the form 'FIGURE | VALUE with unit | PERIOD | PUBLISHER and document | URL | how it is measured'. Report only figures actually stated by a source you opened, never estimates; prefer primary sources (France Assureurs, ACPR, BOFiP, the comparator's own barometer page) over press; at most 30 lines; no introduction, no conclusion."); }
 function fmtElapsed(t0) { return Math.round((performance.now() - t0) / 1000) + " s"; }
+function parseMemo(memo) {
+  const items = [];
+  memo.split(/\r?\n/).forEach(line => { const l = line.replace(/^\s*(?:\d+[.)]|[-•*])\s*/, "").trim(); if ((l.match(/\|/g) || []).length < 3) return; const f = l.split("|").map(x => x.trim()); const url = (l.match(/https?:\/\/\S+/) || [""])[0].replace(/[).,]+$/, "");
+    const raw = f[1] || ""; const num = raw.replace(/\s/g, "").match(/-?\d+(?:[.,]\d+)?/); if (!num) return; let v = parseFloat(num[0].replace(",", ".")); let unit = "";
+    if (/bn|md€|milliard|billion/i.test(raw)) { v *= 1e9; unit = "€"; } else if (/\bm€|million|\bmn\b/i.test(raw)) { v *= 1e6; unit = "€"; } else if (/‰/.test(raw)) unit = "‰"; else if (/%/.test(raw)) { v = v / 100; unit = "%"; } else if (/€|eur/i.test(raw)) unit = /\/yr|\/an|par an/i.test(raw) ? "€/yr" : "€"; else if (/km/i.test(raw)) unit = "km";
+    items.push({ key: null, label: f[0].replace(/\*\*/g, ""), value: v, raw, unit, period: f[2] || "", source: (f[3] || "").replace(/\*\*/g, ""), url, confidence: "unstructured", note: f.slice(5).join(" | ").replace(url, "").trim() }); });
+  return items;
+}
 async function structureMemo(memo, focus) {
+  const sys = "Convert the research memo into structured items. Keep only figures with a numeric value, a source and a URL. Map each figure to a key from the list when it matches the key's definition exactly (units: percentages as fractions, frequencies in per mille, money in euros, comparator quotes in euros per year); otherwise key = null. Do not invent figures. Call the report_benchmark tool with the result.";
+  const userMsg = { role: "user", content: "Key definitions: " + JSON.stringify(BENCH_KEYS) + "\n\nResearch memo:\n" + memo };
+  let d2 = null, mode = "forced";
   $("bc_status").textContent = "Step 2 of 2 — structuring the memo…";
-  const d2 = await apiCall({ model: $("model").value, max_tokens: 6000, system: "Convert the research memo into structured items. Keep only figures with a numeric value, a source and a URL. Map each figure to a key from the list when it matches the key's definition exactly (units: percentages as fractions, frequencies in per mille, money in euros); otherwise key = null. Do not invent figures.", messages: [{ role: "user", content: "Key definitions: " + JSON.stringify(BENCH_KEYS) + "\n\nResearch memo:\n" + memo }], tools: [BENCH_TOOL], tool_choice: { type: "tool", name: "report_benchmark" } }, { timeout: 120000 });
+  try { d2 = await apiCall({ model: $("model").value, max_tokens: 6000, system: sys, messages: [userMsg], tools: [BENCH_TOOL], tool_choice: { type: "tool", name: "report_benchmark" } }, { timeout: 120000 }); }
+  catch (e) { if (!/tool_choice|not supported/i.test(e.message)) throw e; mode = "auto"; $("bc_status").textContent = "Step 2 of 2 — structuring the memo (tool call left to the model)…"; d2 = await apiCall({ model: $("model").value, max_tokens: 6000, system: sys + " If you cannot call the tool, answer with the JSON object only.", messages: [userMsg], tools: [BENCH_TOOL] }, { timeout: 120000 }); }
   const tu = (d2.content || []).find(b => b.type === "tool_use"); let parsed = tu ? tu.input : null;
-  if (!parsed) { const txt = (d2.content || []).filter(b => b.type === "text").map(b => b.text).join("\n"); parsed = repairJson(txt); }
-  const items = (parsed.items || []).filter(it => it && it.label && typeof it.value === "number").map(it => ({ key: it.key && BENCH_KEYS[it.key] ? it.key : null, label: it.label, value: it.value, unit: it.unit || "", period: it.period || "", source: it.source || "", url: it.url || "", confidence: it.confidence || "medium", note: it.note || "" }));
-  S.bench = { collected_at: parsed.collected_at || new Date().toISOString().slice(0, 10), focus, items, memo }; renderBench();
+  if (!parsed) { const txt = (d2.content || []).filter(b => b.type === "text").map(b => b.text).join("\n"); parsed = repairJson(txt); mode += "+json"; }
+  let items = (parsed.items || []).filter(it => it && it.label && typeof it.value === "number").map(it => ({ key: it.key && BENCH_KEYS[it.key] ? it.key : null, label: it.label, value: it.value, unit: it.unit || "", period: it.period || "", source: it.source || "", url: it.url || "", confidence: it.confidence || "medium", note: it.note || "" }));
+  if (!items.length) { items = parseMemo(memo); mode = "memo parser"; }
+  S.bench = { collected_at: parsed.collected_at || new Date().toISOString().slice(0, 10), focus, items, memo, mode }; renderBench();
   return items;
 }
 async function runCollector() {
@@ -1116,9 +1129,10 @@ async function runCollector() {
       break;
     }
     if (!memo.trim()) throw new Error("the search returned no text");
+    S.bench = { collected_at: new Date().toISOString().slice(0, 10), focus, items: parseMemo(memo), memo, mode: "memo parser (preliminary)" }; renderBench(); $("bc_memo_box").open = false;
     const items = await structureMemo(memo, focus);
     $("bc_status").textContent = items.length + " figures from " + searches + " searches in " + fmtElapsed(t0) + " (" + items.filter(i => i.key).length + " matched to parameters).";
-  } catch (e) { const aborted = e.name === "AbortError"; $("bc_status").textContent = aborted ? "Cancelled after " + fmtElapsed(t0) + (memo ? " — the memo collected so far is shown above; you can structure it with the button." : ".") : "Failed after " + fmtElapsed(t0) + ": " + e.message + (/(tool|web_search|not enabled|permission)/i.test(e.message) ? " — the web-search tool must be enabled for this API key (Settings → Test)." : "") + (memo ? " The memo collected so far is shown above." : ""); }
+  } catch (e) { const aborted = e.name === "AbortError"; $("bc_status").textContent = aborted ? "Cancelled after " + fmtElapsed(t0) + (memo ? " — the memo collected so far is shown above; you can structure it with the button." : ".") : "Failed after " + fmtElapsed(t0) + ": " + e.message + (/(web_search|web search|not enabled|permission)/i.test(e.message) ? " — the web-search tool must be enabled for this API key (Settings → Test)." : "") + (memo ? " The memo collected so far is shown above." : ""); }
   finally { $("bc_run").disabled = false; $("bc_cancel").hidden = true; S.abort = null; }
 }
 $("bc_cancel").addEventListener("click", () => { if (S.abort) S.abort.abort(); });
@@ -1131,14 +1145,23 @@ async function testConnection() {
   } catch (e) { out.textContent = "Key test failed: " + e.message; }
 }
 $("test-btn").addEventListener("click", testConnection);
-function benchFmt(it) { const v = it.value; if (typeof v !== "number") return String(v); if (it.unit === "%") return fmt(v, "pct"); if (it.unit === "‰") return v.toFixed(1) + " ‰"; return fmt(v) + (it.unit && it.unit !== "text" ? " " + it.unit : ""); }
+function benchFmt(it) { const v = it.value; if (typeof v !== "number") return String(v); if (it.unit === "%") return fmt(v, "pct"); if (it.unit === "‰") return v.toFixed(1) + " ‰"; if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(2).replace(/\.?0+$/, "") + " bn " + (it.unit || "€"); if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, "") + " M" + (it.unit || "€"); return fmt(v) + (it.unit && it.unit !== "text" ? " " + it.unit : ""); }
+function hostOf(u) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return u || ""; } }
+function benchGroup(k, label) { const l = (label || "").toLowerCase(); if (k && /^tx_|^irsa/.test(k) || /tsca|fgao|fgti|cat ?nat|taxe|irsa/.test(l)) return "Taxes, contributions and IRSA"; if (k && /^cmp_|^mk_/.test(k) || /lelynx|lesfurets|assurland|comparat|quote|devis|barom/.test(l)) return "Comparators and distribution"; if (k && /^fa_[fc]_/.test(k) || /fr[ée]quen|co[uû]t moyen|average cost|severity/.test(l)) return "Claims frequency and cost"; if (/premium|prime|combined|ratio|lapse|r[ée]siliation|market|march[ée]|turnover|chiffre/.test(l) || (k && /^fa_/.test(k))) return "Market statistics"; return "Other figures"; }
 function renderBench() {
   const b = S.bench; const chip = $("bc_chip"); if (!b) { chip.className = "chip"; chip.innerHTML = "<i></i>no benchmark loaded"; return; }
-  chip.className = "chip ok"; chip.innerHTML = "<i></i>" + b.items.length + " figures · " + b.collected_at;
-  let h = "<table class='t'><tr><th>Figure</th><th>Value</th><th>Period</th><th>Source</th><th>Conf.</th><th>Parameter</th></tr>";
-  b.items.forEach((it, i) => { const tk = it.key && CMP_MAP[it.key] ? CMP_MAP[it.key] : it.key; const cur = tk && paramValue(tk) != null ? paramValue(tk) : null; const mapped = tk && META.find(m => m.k === tk); h += "<tr><td style='text-align:left'>" + it.label + (it.note ? "<br><span style='font-size:11px;color:var(--ink-3)'>" + it.note + "</span>" : "") + "</td><td>" + benchFmt(it) + "</td><td>" + (it.period || "") + "</td><td style='text-align:left;font-size:11px'>" + (it.url ? "<a href='" + it.url + "' target='_blank' rel='noopener'>" + (it.source || it.url) + "</a>" : (it.source || "")) + "</td><td>" + (it.confidence || "") + "</td><td>" + (mapped ? "<button class='btn small' data-apply='" + i + "'>apply" + (CMP_MAP[it.key] ? " as " + (isPct(mapped.u) ? "" : fmt(ttcToHt(it.value)) + " € HT") : "") + (cur != null ? " (now " + (isPct(mapped.u) ? fmt(cur, "pct") : fmt(cur)) + ")" : "") + "</button>" : "<span style='color:var(--ink-3)'>—</span>") + "</td></tr>"; });
-  $("bc_out").innerHTML = h + "</table>" + (b.memo ? "<details style='margin-top:8px'><summary style='cursor:pointer;font-size:12px;color:var(--ink-2)'>Research memo (as written by the search step)</summary><pre style='white-space:pre-wrap;font-size:12px;color:var(--ink-2);margin:6px 0 0'>" + esc(b.memo) + "</pre></details>" : "");
+  chip.className = "chip ok"; chip.innerHTML = "<i></i>" + b.items.length + " figures · " + b.collected_at + (b.mode ? " · " + b.mode : "");
+  const keyOpts = k => "<option value=''>— not mapped —</option>" + Object.keys(BENCH_KEYS).map(x => "<option value='" + x + "'" + (x === k ? " selected" : "") + ">" + BENCH_KEYS[x] + "</option>").join("");
+  const groups = {}; b.items.forEach((it, i) => { const g = benchGroup(it.key, it.label); (groups[g] = groups[g] || []).push(i); });
+  let h = "<table class='t'><tr><th style='text-align:left'>Figure</th><th>Value</th><th>Period</th><th style='text-align:left'>Source</th><th>Conf.</th><th style='text-align:left'>Parameter</th><th>Model now</th><th>Gap</th><th></th></tr>";
+  Object.keys(groups).forEach(g => { h += "<tr><th colspan=9 style='text-align:left;color:var(--violet-deep);background:var(--surface)'>" + g + "</th></tr>";
+    groups[g].forEach(i => { const it = b.items[i]; const tk = it.key && CMP_MAP[it.key] ? CMP_MAP[it.key] : it.key; const meta = tk && META.find(m => m.k === tk); const cur = meta && paramValue(tk) != null ? paramValue(tk) : null; const newv = it.key && typeof it.value === "number" ? (CMP_MAP[it.key] ? Math.round(ttcToHt(it.value)) : it.value) : null; const gap = cur != null && newv != null && cur !== 0 ? (newv - cur) / Math.abs(cur) : null;
+      const conf = it.confidence === "high" ? "<span class='chip ok'><i></i>high</span>" : it.confidence === "medium" ? "<span class='chip warn'><i></i>medium</span>" : "<span class='chip'><i></i>" + (it.confidence || "n/a") + "</span>";
+      h += "<tr><td style='text-align:left'>" + it.label + (it.note ? "<br><span style='font-size:11px;color:var(--ink-3)'>" + it.note.slice(0, 160) + "</span>" : "") + "</td><td><b>" + benchFmt(it) + "</b>" + (it.raw && it.raw !== benchFmt(it) ? "<br><span style='font-size:11px;color:var(--ink-3)'>" + it.raw + "</span>" : "") + "</td><td>" + (it.period || "") + "</td><td style='text-align:left;font-size:12px'>" + (it.url ? "<a href='" + it.url + "' target='_blank' rel='noopener' title='" + it.url + "'>" + (it.source || hostOf(it.url)) + "</a><br><span style='color:var(--ink-3);font-size:11px'>" + hostOf(it.url) + "</span>" : (it.source || "")) + "</td><td>" + conf + "</td><td style='text-align:left'><select data-map='" + i + "' style='max-width:220px;font-size:12px;padding:3px;border:1px solid var(--line);border-radius:4px'>" + keyOpts(it.key) + "</select></td><td>" + (cur != null ? (meta && isPct(meta.u) ? fmt(cur, "pct") : fmt(cur)) : "–") + "</td><td style='" + (gap != null && Math.abs(gap) > 0.15 ? "color:var(--bad);font-weight:600" : "") + "'>" + (gap != null ? (gap >= 0 ? "+" : "") + (gap * 100).toFixed(0) + " %" : "–") + "</td><td>" + (meta && newv != null ? "<button class='btn small primary' data-apply='" + i + "'>apply" + (CMP_MAP[it.key] ? " " + fmt(newv) + " € HT" : "") + "</button>" : "") + "</td></tr>"; }); });
+  $("bc_out").innerHTML = h + "</table><div class='mcctl' style='margin-top:8px'><button class='btn small' id='bc_csv'>Export table (.csv)</button><span class='note' style='margin:0'>Gap = new value versus the parameter now; red above 15 %. Map a figure to a parameter with the dropdown, then apply.</span></div>";
   $("bc_out").querySelectorAll("button[data-apply]").forEach(btn => btn.addEventListener("click", () => applyBench(+btn.dataset.apply)));
+  $("bc_out").querySelectorAll("select[data-map]").forEach(sel => sel.addEventListener("change", () => { const it = S.bench.items[+sel.dataset.map]; it.key = sel.value || null; renderBench(); }));
+  const csvb = $("bc_csv"); if (csvb) csvb.addEventListener("click", () => { const csv = "label,value,unit,period,source,url,confidence,key,note\n" + b.items.map(it => [it.label, it.value, it.unit, it.period, it.source, it.url, it.confidence, it.key || "", it.note].map(x => '"' + String(x == null ? "" : x).replace(/"/g, "'") + '"').join(",")).join("\n"); const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); a.download = "Nexius_benchmark_" + b.collected_at + ".csv"; a.click(); });
 }
 function applyBench(i) { const it = S.bench.items[i]; if (!it.key || typeof it.value !== "number") return; const tk = CMP_MAP[it.key] || it.key; const m = META.find(x => x.k === tk); if (!m) return; if (!S.inputs) S.inputs = Object.assign({}, E.DEFAULTS); S.inputs[tk] = CMP_MAP[it.key] ? Math.round(ttcToHt(it.value)) : it.value; S.base = E.run(baseInputs(), S.scen[activeIdx()]); recompute(); renderParams(); renderBench(); }
 $("bc_run").addEventListener("click", runCollector);
